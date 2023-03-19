@@ -1,0 +1,3 @@
+https://www.yuque.com/g/oblilimk/kl164v/vi65g2pa6l00llze/collaborator/join?token=p9rdD7gCmh3wn350# 《支付模块》
+
+[支付宝参数](https://blog.csdn.net/thc1987/article/details/80269181?spm=1001.2101.3001.6650.2&utm_medium=distribute.pc_relevant.none-task-blog-2%7Edefault%7ECTRLIST%7ERate-2-80269181-blog-34813763.pc_relevant_recovery_v2&depth_1-utm_source=distribute.pc_relevant.none-task-blog-2%7Edefault%7ECTRLIST%7ERate-2-80269181-blog-34813763.pc_relevant_recovery_v2&utm_relevant_index=5)
