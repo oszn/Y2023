@@ -13,10 +13,13 @@
 - [ ] 动态限流
 - [ ] 高可用
 - [ ] 可扩展
+- [ ] LSM-Tree 作为库存系统持久化。
+
+[toc]
 
 
 
-[TOC]
+
 
 ## 对订单系统的理解
 
@@ -35,6 +38,8 @@
 `有序驱动`也就是一个，对过程容忍行为吧。比如创建订单可以容忍支付失败，但是绝不能容易扣除库存失败。支付失败必须要在有订单的基础上才行。也就是过程必须是有序的。订单一旦创建成功，必须是在库存扣除成功的前提，而支付一旦成功，必须在订单创建入库的原则下。也就是`事务性`吧,但这些操作写不到一个事务里面，也就是有序的事务性，但是为了完整事务，但即使失败也必须将失败的事务补偿回来。
 
 `补偿`。如果过程是完整，也就不会这么多事情，但是肯定会出现订单创建失败，或者支付失败或者丢失的情况。这种情况下需要判断下一个操作是否成功，再来决定返还事宜。如果创建订单操作失败了，必须将订单的库存返还回来才行。支付由于超时或者其他的异常错误，导致没有`明确`的返回结果，从而导致事务回滚或者未生效，这是不被允许的，应该尽快查询支付状态，修改订单状态。
+
+`强迫进行`。比如说，用户选择创建订单，那么订单除去库存不足的情况，就应该被成功创建（组件故障导致的需要紧急处理），也就是最终成功性。不能说系统除了故障就创建失败了吧，再比如用户既然提出了支付，那么最好只有2种结果，支付前不够导致的失败，和最终的成功。用户进行重试，理论上来说并不是一个很好的体验，目前来说只能通过redis和mq结合补偿才能完成这个。
 
 ## 高并发
 
@@ -232,3 +237,151 @@ return 1;
 ### **不足**
 
 订单的数据库操作都是单线程处理，肯定会造成瓶颈。或许可以将多个商品返回库存操作拆分成，多个单独的请求，这样可以造成失败请求减少，但对属于统一订单的商品原子性可能造成破坏。这样好处是，对相同的商品分到同一个队列，加速库存入库。消息队列不能长期宕机，一旦消息队列g了，那么会造成消息积压，库存数据库一致性受损。整个过程中数据库可以g，redis可以g，代码也可以g，但是消息队列肯定不能g。
+
+### 思考
+
+1. 真的需要同步数据库嘛？？？
+
+网上一直说，数据库作为持久化是必要的，但现在redis这么稳定，直接放redis里也可以吧，宕机了也有从服务器。
+
+2. 持久化可以尝试用写多读少的组件。
+
+之前看过lsm数据结构，感觉这个应该很适合库存场景，由于数据库写太费时间采用缓存，而lsm可以做到o（1）的增删改过程，非常适合库存系统，可以同步双写缓存和lsm，有读取场景，也只会有一个地方能够读取，慢点就慢点吧。或者说频繁的改动，势必会将库存打入到lsm的memory层，即使宕机的时候也能够很快的访问到。
+
+
+
+## 订单系统
+
+订单系统，由自动机支撑起幂等性，与正确性，简单的show下代码，结构还是很清晰的。
+
+由controller触发发送消息到mq。
+
+```java
+    @Override
+    public void dispatchMq(String orderNo, CommodityOrderActionEnum action, Object param) {
+        CommodityOrderFsmMO orderMO = new CommodityOrderFsmMO(action.getAction(), orderNo, param);
+        redisCache.incr("action->" + action.getAction(), 1);
+        mqClient.sendTaskMsg(MqMsgTypeEnum.COMMODITY_ORDER_MQ, orderMO);
+//        mqClient.sendKafkaTaskMsgTopic1(MqMsgTypeEnum.COMMODITY_ORDER_MQ, orderMO);
+    }
+```
+
+到了消息队列后，整体设计模式是由装饰者设计模式构建出有限状态自动机,此部分结构非常简单。
+
+```java
+  new CommodityOrderFsmManageBuilder()
+                    .setActionEnum(actionEnum)
+                    .setOrderBriefBO(orderBriefBO)
+                    .setParam(param)
+                    .build()
+                    .handle();
+```
+
+handle过程分为处理订单和订单后触发逻辑。
+
+handle为核心过程，主要是创建订单与修改订单状态。
+
+action则是行为，主要是订单创建成功后所触发的连锁反应，如通知用户，删除订单缓存等等。
+
+
+```java
+    public void handle() {
+        long s1 = System.currentTimeMillis();
+        getFsm().handle();
+        long s2 = System.currentTimeMillis();
+        getAction().onAction(getOrderBriefBO());
+        long s3 = System.currentTimeMillis();
+        log.info("action {},handle time{},action time{}", getAction(), s2 - s1, s3 - s2);
+    }
+```
+
+其中各个订单状态的转移，非常重要。所以在自动的handle过程中需要判断状态，也就是checkAction。
+
+```java
+    void handle() {
+        checkAction();
+        checkParam();
+        doHandle();
+    }
+```
+
+例如创建订单的状态，只能是newaction。如果遇到payaction和cancle action是不合理的。
+
+**当订单创建后，变为待支付状态，此时允许的动作只有支付与主动取消和自动取消。**而一切参数ok后，就按照不同的action做出不同的动作，自动机的选取是根据数据库中保存的state字段，例如TO_PAY，读取到自动机后为pay自动机，此时再来核对action。
+
+### 订单过程错误发生。
+
+订单过程，主要为以下3个过程（优惠卷模块还没写）。
+
+1. 库存过程。
+2. 订单创建过程。
+3. 支付过程。
+
+发生错误的位置有7处，也就是前前后后+3个过程，对此过程，我选择了每处状态标记。
+
+整个流程都在本文的3.5处。
+
+伪代码如下
+
+```
+saveOrder(){
+ mq.sendDelayMq(order+timestampe,commodity_details)// 发送延迟消息 remark 1
+ subInvenotry()//扣减库存 remark 2（具体看上一章）。
+//remakr 3 这个过程中由remark 1的消息队列维护。
+ saveOrder()//保存订单。remark 4(事务维护数据库，库存还是有remark1的消息队列维护，由于带有时间戳，就算重试，也是可以返回第二次的扣减库存)
+ initSuccess()//通知商品服务，订单创建成功remark5(靠的是remark2中redis脚本写入的字段)
+ payOrder()//支付订单remark6(订单支付，远程服务，不具有事务性,通过下面的doSafaPay进行)。
+ //remark7此处再次发生故障没有意义，因为一旦remark4成功后，之后的消息都无法走到此处。
+}
+```
+
+`幂等性？`
+
+此消息失败也是有幂等性的，扣除的库存肯定能补偿回来。创建订单成功后，后续的操作到了remark4就不会进行了。
+
+#### remark1 fail
+
+消息队列发送都失败了，直接报错重试完了。
+
+#### remark2 fail
+
+库存不足，直接返回库存不足的消息，如果是其他的异常，需要尝试再次消费消息。
+
+#### remark3 fail
+
+remark1的延迟消息队列起作用，假设重试过程中创建成功了，也不需要担心，订单有一个时间戳字段，如果时间戳不同，直接认为是2次操作，返还库存即可。
+
+#### remark4 fail
+
+这个与上同理。
+
+#### remark5 fail
+
+这个主要是延迟消息回来判断，如果redis中这些字段都没删除，那就直接进行，查库，如果库没有就直接认为没成功返回库存。
+
+#### remark6 fail
+
+这个只能失败一次，所以需要额外维护，也就是上面那个safepay，将消息写入zscore，然后根据时间戳，设置一个最大的超时时间，定时任务去拉去redis中超时的支付，判断是否支付成功，如果遇到了支付服务不可用的情况，直接等下一批次就完事了。直到支付服务可用为止。
+
+#### remark7 fail
+
+这里失败没有任何意义。
+
+#### 总结
+
+前3个没封装好，应该放到库存系统里去做，不应该出现在订单系统代码这里，后面拆分再说。
+
+remark5位置还得讨论，放在此处还是给自动机的action去发一个消息队列。
+
+## 支付系统
+
+loading ... on my way
+
+## 其他组件
+
+### 配置升级兼容过程
+
+rabbitmq并不能做到高可用,而且吞吐有限,所以先兼容Kafka再说.具体创建集群Kafka，和兼容rabbitmq代码文章如下.
+
+[支持高可用高并发的Kafka消息队列](./组件/消息队列.md) 
+
