@@ -95,7 +95,33 @@
 
 **消息队列可用性**
 
-loading
+想法是使用策略模式将消息队列的消费都集中起来，这里在加载如不同的消息队列，做到消息队列无关。
+
+例如消息队列R(Rabbit)+K(Kafka).
+
+我设计的部分Mq的消息总是从偶数开始，不知道对负载均是否影响。
+
+伪代码
+
+```java
+int type=MQ_MSG_TYPE%2
+boolean result=false;
+if (type==0){
+	boolean success=R.sendMsgTask(task);
+	if(!success){
+		success=K.sendMsgTask(task);
+	}
+	result=result||success;
+}else if(type==1){
+	boolean success=K.sendMsgTask(task);
+	if(!success){
+		success=R.sendMsgTask(task)
+	}
+	result=result||success;
+}
+```
+
+
 
 **消息队列的消费模式**
 
