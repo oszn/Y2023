@@ -27,9 +27,10 @@
 2. 商品不允许超量下订单。
 3. 用户可以对商品执行支付。
 4. 用户可以在完成终态前任何一个状态取消订单。
-5. 商家可以发送商品。
-6. 用户可以签收商品。
-7. 用户可以查询商品。
+5. 订单超时未支付，自动取消。
+6. 商家可以发送商品。
+7. 用户可以签收商品。
+8. 用户可以查询商品。
 
 **非功能性需求**：
 
@@ -55,13 +56,17 @@
 
 
 
-### 系统架构
+### 订单系统架构
 
 基于以上的流程，我们可以将整个订单系统抽象为订单由action触发的订单转移过程，也是订单系统的核心过程。对于此过程，可以进一步抽象出不同state下，对应的action执行造成的影响过程，所以订单系统架构将由前面所述展开，使用有限状态自动机完成相关订单转移过程。首先根据前述功能性需求，可以提供多个服务，其中对应着以上的action部分，所以系统的服务部分针对用户action进行。而对于action的状态，则需要通过订单目前的状态进行查询。
 
 ![](./img/action2.png)
 
 对于state，如果action是init，会直接指定initstate，其他的情况都是直接通过orderNo获取相应的state，然后再从action的map中寻找相应的状态机。**而在订单action执行过程中，涉及到库存部分以及支付部分**，遵循单一功能原则，将库存模块与支付模块分开。整个订单系统分为订单模块，库存系统，支付系统三个部分。
+
+### 整体架构
+
+![](./img/zk.svg)
 
 ### 难点
 
@@ -71,6 +76,7 @@
 1. 库存，订单，支付系统一致性问题。
 1. 订单补偿问题。
 1. 整个订单系统架构设计。
+1. 组件系统的架构设计。
 
 非功能性难点
 
@@ -123,7 +129,40 @@ if (type==0){
 
 
 
-**消息队列的消费模式**
+**消息队列的架构**
 
-loading
+Mq的消费者行为，目前我看来可以分解为单词消费与批量消费过程，而对于单次消费过程又可以理解为process消息。所以消费队列的单次消费过程，完全可以由策略模式封装。
 
+```java
+public interface MqMsgProcessor<T extends MqMsgBodyMO> {
+    MqMsgTypeEnum getMsgTypeEnum();
+    MqSubMsgTypeEnum getSubMsgTypeEnum();
+    Class<T> getBodyClazz();
+    boolean process(T body, int version);
+}
+```
+
+
+MsgType+SubMsgType确认唯一的MqMsgProcessor。而对于版本支持，则是从process层面去实现的。
+
+```java
+public class MqMsgMO {
+    private Integer msgType;
+    private String msgId;
+    private Integer version;
+    private Integer subMsgType;
+    private String subMsgId;
+    private Integer subVersion;
+    protected String body;
+...
+```
+
+设置SubMsgType是为了方便下游消息管理，例如一个创建订单操作，可以会触发多个下游mq，这些mq使用相同的MsgType，各自有各自的SubMsgType在发送消息的时候，只需要知道MsgType就能给所有的子消息发送消息了。
+
+![](./img/MqUml.png)
+
+### 代码
+
+目前已经完成了第一个版本迭代，下一个版本迭代希望从基础功能到高并发场景，库存锁粒度细分，库存token化，优惠卷系统接入，完成模块细分微服务化。
+
+核心代码demo在code文件夹内，当项目完成下一个版本迭代将会完全开源。
